@@ -10,4 +10,5 @@ lazy_static = "1.0"
 termios = "0.3"
 isatty = "0.1"
 users = { git = "https://github.com/Arcterus/rust-users", branch = "passwd" }
+platform-info = { git = "https://github.com/uutils/platform-info" }
 

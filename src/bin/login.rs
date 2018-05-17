@@ -5,12 +5,12 @@ extern crate libc;
 extern crate pwhash;
 extern crate termios;
 extern crate users;
+extern crate platform_info;
 
 use std::io;
 use std::io::{Read, Write};
 use std::ffi::{CStr, CString};
 use std::str;
-use std::mem;
 use libc::{EXIT_FAILURE, EXIT_SUCCESS};
 use std::path::Path;
 use std::process::{self, Command};
@@ -20,6 +20,7 @@ use std::thread;
 use std::fs::File;
 use users::User;
 use users::os::unix::UserExt;
+use platform_info::*;
 
 const TIMEOUT: u32 = 60;
 const ENV_USER: &str = "USER";
@@ -27,38 +28,9 @@ const ENV_LOGNAME: &str = "LOGNAME";
 const ENV_HOME: &str = "HOME";
 const ENV_SHELL: &str = "SHELL";
 
-#[doc(hidden)]
-pub trait IsMinusOne {
-    fn is_minus_one(&self) -> bool;
-}
-
-macro_rules! impl_is_minus_one {
-    ($($t:ident)*) => ($(impl IsMinusOne for $t {
-        fn is_minus_one(&self) -> bool {
-            *self == -1
-        }
-    })*)
-}
-
-impl_is_minus_one! { i8 i16 i32 i64 isize }
-
-pub fn cvt<T: IsMinusOne>(t: T) -> io::Result<T> {
-    if t.is_minus_one() {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(t)
-    }
-}
-
 fn get_username() -> io::Result<String> {
-    let nodename;
-    unsafe {
-        let mut utsname: libc::utsname = mem::uninitialized();
-        cvt(libc::uname(&mut utsname))?;
-        nodename = CStr::from_ptr(utsname.nodename.as_ptr())
-            .to_string_lossy()
-            .into_owned();
-    }
+    let info = PlatformInfo::new()?;
+    let nodename = info.nodename();
     if nodename.is_empty() {
         print!("?");
     } else {
