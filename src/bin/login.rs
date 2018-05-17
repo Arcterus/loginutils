@@ -119,7 +119,7 @@ extern "C" fn alarm_handler(
 fn main() {
     unsafe {
         if libc::signal(libc::SIGALRM, alarm_handler as usize) == libc::SIG_ERR {
-            libc::exit(EXIT_FAILURE);
+            process::exit(EXIT_FAILURE);
         }
         libc::alarm(TIMEOUT);
     }
@@ -246,13 +246,13 @@ fn main() {
         if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
             process::exit(EXIT_FAILURE);
         };
+    }
 
-        // Message of the day
-        if let Ok(mut file) = File::open("/etc/motd") {
-            let mut message = String::new();
-            if let Ok(_) = file.read_to_string(&mut message) {
-                println!("{}", message);
-            }
+    // Message of the day
+    if let Ok(mut file) = File::open("/etc/motd") {
+        let mut message = String::new();
+        if let Ok(_) = file.read_to_string(&mut message) {
+            println!("{}", message);
         }
     }
 
