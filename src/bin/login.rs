@@ -4,22 +4,28 @@ extern crate lazy_static;
 extern crate libc;
 extern crate pwhash;
 extern crate termios;
+extern crate users;
 
 use std::io;
-use std::io::{Error, ErrorKind, Read, Write};
+use std::io::{Read, Write};
 use std::ffi::{CStr, CString};
 use std::str;
 use std::mem;
-use std::ptr;
 use libc::{EXIT_FAILURE, EXIT_SUCCESS};
 use std::path::Path;
+use std::process::{self, Command};
+use std::os::unix::process::CommandExt;
+use std::time::Duration;
+use std::thread;
 use std::fs::File;
+use users::User;
+use users::os::unix::UserExt;
 
 const TIMEOUT: u32 = 60;
-const ENV_USER: &'static [u8] = b"USER\0";
-const ENV_LOGNAME: &'static [u8] = b"LOGNAME\0";
-const ENV_HOME: &'static [u8] = b"HOME\0";
-const ENV_SHELL: &'static [u8] = b"SHELL\0";
+const ENV_USER: &str = "USER";
+const ENV_LOGNAME: &str = "LOGNAME";
+const ENV_HOME: &str = "HOME";
+const ENV_SHELL: &str = "SHELL";
 
 #[doc(hidden)]
 pub trait IsMinusOne {
@@ -90,30 +96,10 @@ fn get_password() -> io::Result<String> {
     Ok(String::from(password.trim()))
 }
 
-fn get_passwd(username: &str) -> io::Result<*mut libc::passwd> {
-    let username_cstring = match CString::new(username) {
-        Ok(name) => name,
-        Err(_) => return Err(Error::new(ErrorKind::Other, "username is invalid")),
-    };
-    let pw = unsafe { libc::getpwnam(username_cstring.as_ptr()) };
-    if pw.is_null() {
-        Err(Error::new(
-            ErrorKind::Other,
-            "matching entry is not found or an error occurs",
-        ))
-    } else {
-        Ok(pw)
-    }
-}
+fn check_password(user: &User, password: &str) -> io::Result<bool> {
+    let passwd = user.password();
 
-fn check_password(passwd: *mut libc::passwd, password: &str) -> io::Result<bool> {
-    let pw_passwd = unsafe {
-        CStr::from_ptr((*passwd).pw_passwd)
-            .to_string_lossy()
-            .to_owned()
-    };
-
-    match pw_passwd.as_ref() {
+    match passwd.as_ref() {
         // account is locked or no password
         "!" | "*" => Ok(false),
         // shadow password
@@ -121,7 +107,12 @@ fn check_password(passwd: *mut libc::passwd, password: &str) -> io::Result<bool>
             let hash;
 
             unsafe {
-                let spwd = libc::getspnam((*passwd).pw_name);
+                // XXX: this is not great
+                let name = match CString::new(user.name()) {
+                    Ok(name) => name,
+                    Err(_) => process::exit(EXIT_FAILURE),
+                };
+                let spwd = libc::getspnam(name.as_ptr());
                 if spwd.is_null() {
                     return Err(From::from(io::Error::last_os_error()));
                 }
@@ -131,16 +122,9 @@ fn check_password(passwd: *mut libc::passwd, password: &str) -> io::Result<bool>
             Ok(pwhash::unix::verify(password, &hash))
         }
         // plain correct password
-        pw_passwd if pw_passwd == password => Ok(true),
+        passwd if passwd == password => Ok(true),
         // incorrect password
         _ => Ok(false),
-    }
-}
-
-fn delay(seconds: u32) {
-    let mut ret = 1;
-    while ret > 0 {
-        ret = unsafe { libc::sleep(seconds) };
     }
 }
 
@@ -186,12 +170,10 @@ fn main() {
     let mut state = State::U;
     let tries = 3;
     let mut failcount = 0;
-    let mut passwd: *mut libc::passwd = ptr::null_mut();
+    let mut user = User::new(0, "", 0);
     loop {
-        unsafe {
-            if libc::tcflush(0, libc::TCIFLUSH) == -1 {
-                libc::exit(EXIT_FAILURE);
-            }
+        if unsafe { libc::tcflush(0, libc::TCIFLUSH) } == -1 {
+            process::exit(EXIT_FAILURE);
         }
         state = match state {
             State::U => match get_username() {
@@ -209,17 +191,17 @@ fn main() {
             State::P => match get_password() {
                 Ok(ret) => {
                     password = ret;
-                    match get_passwd(&username) {
-                        Ok(ret) => {
-                            passwd = ret;
+                    match users::get_user_by_name(&username) {
+                        Some(ret) => {
+                            user = ret;
                             State::C
                         }
-                        Err(_) => State::F,
+                        None => State::F,
                     }
                 }
                 Err(_) => State::F,
             },
-            State::C => match check_password(passwd, &password) {
+            State::C => match check_password(&user, &password) {
                 Ok(true) => {
                     println!("Login success");
                     break;
@@ -227,7 +209,7 @@ fn main() {
                 Ok(false) | Err(_) => State::F,
             },
             State::F => {
-                delay(3);
+                thread::sleep(Duration::from_secs(3));
                 println!("\nLogin incorrect");
                 failcount += 1;
                 if failcount < tries {
@@ -238,67 +220,61 @@ fn main() {
                 }
             }
             State::X => {
-                unsafe { libc::exit(EXIT_FAILURE) };
+                process::exit(EXIT_FAILURE)
             }
         }
     }
     unsafe {
         libc::alarm(0);
+    }
 
-        let path = "/etc/nologin";
-        if (*passwd).pw_uid != 0
-            && libc::access(CString::new(path).unwrap().as_ptr(), libc::R_OK) == 0
+    let path = "/etc/nologin";
+    if user.uid() != 0
+            && unsafe { libc::access(CString::new(path).unwrap().as_ptr(), libc::R_OK) } == 0
+    {
+        let mut file = match File::open(&Path::new(path)) {
+            Ok(file) => file,
+            Err(_) => process::exit(EXIT_FAILURE),
+        };
+        let mut message = String::new();
+        match file.read_to_string(&mut message) {
+            Ok(0) => println!("nologin"),
+            Ok(_) => println!("{}", message),
+            Err(_) => process::exit(EXIT_FAILURE),
+        }
+        process::exit(EXIT_FAILURE)
+    }
+
+    let name = match CString::new(user.name()) {
+        Ok(name) => name,
+        Err(_) => process::exit(EXIT_FAILURE),
+    };
+    unsafe {
+        if libc::initgroups(name.as_ptr(), user.primary_group_id()) == -1
+            || libc::setgid(user.primary_group_id()) == -1
+            || libc::setuid(user.uid()) == -1
         {
-            let mut file = match File::open(&Path::new(path)) {
-                Ok(file) => file,
-                Err(_) => libc::exit(EXIT_FAILURE),
-            };
-            let mut message = String::new();
-            match file.read_to_string(&mut message) {
-                Ok(0) => println!("nologin"),
-                Ok(_) => println!("{}", message),
-                Err(_) => libc::exit(EXIT_FAILURE),
-            }
-            libc::exit(EXIT_FAILURE)
+            process::exit(EXIT_FAILURE);
         }
+    }
 
-        if libc::initgroups((*passwd).pw_name, (*passwd).pw_gid) == -1
-            || libc::setgid((*passwd).pw_gid) == -1
-            || libc::setuid((*passwd).pw_uid) == -1
-        {
-            libc::exit(EXIT_FAILURE);
-        }
+    let mut cmd = Command::new(user.shell());
+    if user.home_dir().is_dir() {
+        cmd.current_dir(user.home_dir());
+    } else {
+        println!(
+            "bad $HOME: {}",
+            user.home_dir().display()
+        );
+    }
+    cmd.env(ENV_USER, user.name())
+        .env(ENV_LOGNAME, user.name())
+        .env(ENV_HOME, user.home_dir())
+        .env(ENV_SHELL, user.shell());
 
-        if libc::chdir((*passwd).pw_dir) == -1 {
-            println!(
-                "bad $HOME: {}",
-                CStr::from_ptr((*passwd).pw_dir).to_string_lossy()
-            );
-        }
-
-        libc::setenv(
-            ENV_USER.as_ptr() as *const libc::c_char,
-            (*passwd).pw_name,
-            1,
-        );
-        libc::setenv(
-            ENV_LOGNAME.as_ptr() as *const libc::c_char,
-            (*passwd).pw_name,
-            1,
-        );
-        libc::setenv(
-            ENV_HOME.as_ptr() as *const libc::c_char,
-            (*passwd).pw_dir,
-            1,
-        );
-        libc::setenv(
-            ENV_SHELL.as_ptr() as *const libc::c_char,
-            (*passwd).pw_shell,
-            1,
-        );
-
+    unsafe {
         if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
-            libc::exit(EXIT_FAILURE);
+            process::exit(EXIT_FAILURE);
         };
 
         // Message of the day
@@ -308,14 +284,10 @@ fn main() {
                 println!("{}", message);
             }
         }
-
-        if libc::execl(
-            (*passwd).pw_shell,
-            (*passwd).pw_shell,
-            ptr::null() as *const libc::c_char,
-        ) == -1
-        {
-            libc::exit(EXIT_FAILURE);
-        }
     }
+
+    cmd.exec();
+
+    // exec() failed
+    process::exit(EXIT_FAILURE)
 }
