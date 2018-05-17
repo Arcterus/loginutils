@@ -68,10 +68,8 @@ fn get_password() -> io::Result<String> {
     Ok(String::from(password.trim()))
 }
 
-fn check_password(user: &User, password: &str) -> io::Result<bool> {
-    let passwd = user.password();
-
-    match passwd.as_ref() {
+fn check_password(name: &CStr, real_pass: &str, password: &str) -> io::Result<bool> {
+    match real_pass.as_ref() {
         // account is locked or no password
         "!" | "*" => Ok(false),
         // shadow password
@@ -79,11 +77,6 @@ fn check_password(user: &User, password: &str) -> io::Result<bool> {
             let hash;
 
             unsafe {
-                // XXX: this is not great
-                let name = match CString::new(user.name()) {
-                    Ok(name) => name,
-                    Err(_) => process::exit(EXIT_FAILURE),
-                };
                 let spwd = libc::getspnam(name.as_ptr());
                 if spwd.is_null() {
                     return Err(From::from(io::Error::last_os_error()));
@@ -94,7 +87,7 @@ fn check_password(user: &User, password: &str) -> io::Result<bool> {
             Ok(pwhash::unix::verify(password, &hash))
         }
         // plain correct password
-        passwd if passwd == password => Ok(true),
+        real_pass if real_pass == password => Ok(true),
         // incorrect password
         _ => Ok(false),
     }
@@ -143,6 +136,7 @@ fn main() {
     let tries = 3;
     let mut failcount = 0;
     let mut user = User::new(0, "", 0);
+    let name;
     loop {
         if unsafe { libc::tcflush(0, libc::TCIFLUSH) } == -1 {
             process::exit(EXIT_FAILURE);
@@ -173,13 +167,20 @@ fn main() {
                 }
                 Err(_) => State::F,
             },
-            State::C => match check_password(&user, &password) {
-                Ok(true) => {
-                    println!("Login success");
-                    break;
+            State::C => {
+                let c_name = match CString::new(user.name()) {
+                    Ok(name) => name,
+                    Err(_) => process::exit(EXIT_FAILURE),
+                };
+                match check_password(&c_name, user.password(), &password) {
+                    Ok(true) => {
+                        name = Some(c_name);
+                        println!("Login success");
+                        break;
+                    }
+                    Ok(false) | Err(_) => State::F,
                 }
-                Ok(false) | Err(_) => State::F,
-            },
+            }
             State::F => {
                 thread::sleep(Duration::from_secs(3));
                 println!("\nLogin incorrect");
@@ -217,10 +218,7 @@ fn main() {
         process::exit(EXIT_FAILURE)
     }
 
-    let name = match CString::new(user.name()) {
-        Ok(name) => name,
-        Err(_) => process::exit(EXIT_FAILURE),
-    };
+    let name = name.unwrap();
     unsafe {
         if libc::initgroups(name.as_ptr(), user.primary_group_id()) == -1
             || libc::setgid(user.primary_group_id()) == -1
